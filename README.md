@@ -154,6 +154,24 @@ Only allowance snapshots needed by WidgetKit are copied into the shared App Grou
 container. Widgets never receive OAuth tokens and never contact OpenAI or a proxy
 computer directly. Proxy bearer tokens are stored in a separate Keychain service.
 
+Direct accounts distinguish the authenticated OpenID issuer and user subject from
+the selected workspace (`chatgpt_account_id`). New local identities are derived
+from all three values; email is only a display label. ID tokens are verified with
+OpenAI's published RSA signing keys, issuer, client audience, timestamps, and the
+browser flow's nonce before an account is connected. The workspace ID continues
+to be sent in `ChatGPT-Account-Id`; local IDs scope Keychain items, caches, ordering,
+nicknames, notifications, and widget snapshots.
+
+Existing v1/v2 credentials are copied to v3 Keychain items and read back before
+their old items are removed. Their local IDs remain unchanged to preserve stored
+metadata and caches. A fresh login can reconnect a legacy record only when its
+historical ID-token signature and identity binding can also be verified. An
+expired historical token is never accepted as a new login. Unverifiable legacy
+records remain intact and a new verified login stays separate. Credentials already
+overwritten by the old collision cannot be recovered; those members must sign in
+again. Refresh responses cannot change member or workspace, and a response arriving
+after logout or reconnect cannot replace the newer local credential.
+
 The app currently communicates with these services:
 
 - `auth.openai.com` for authentication and token lifecycle
@@ -186,6 +204,20 @@ Scripts/                   Codemagic Xcode-project preparation
 ```
 
 ## Verify changes
+
+On macOS, run the synthetic core, authentication, Keychain, cache, and widget
+snapshot tests (including the existing parser tests):
+
+```bash
+python3 Scripts/test_host.py
+```
+
+The temporary host package uses copies of the production sources because the
+main package includes UIKit app targets. All HTTP responses and credentials are
+synthetic; Keychain tests use a unique test service. The account identity GitHub
+Actions workflow runs these tests and the unsigned iOS compilation below. It does
+not publish an app or require signing or OpenAI credentials. The existing Codemagic
+workflows remain available for IPA builds and distribution.
 
 Compile the app and test bundle for iOS:
 

@@ -3,111 +3,79 @@ import Security
 import CodexMeterCore
 
 enum KeychainTokenStore {
-    private static let service = "com.picklemike.codexmeter.auth"
-    private static let legacyAccount = "chatgpt-oauth-v1"
-    private static let accountPrefix = "chatgpt-oauth-v2:"
+    static let repository = AccountCredentialRepository(storage: KeychainCredentialStorage(service: "com.picklemike.codexmeter.auth"))
 
-    static func save(_ tokens: AuthTokens) throws {
-        guard !tokens.accountId.isEmpty else {
-            throw MeterError.message("ChatGPT did not return an account identifier.")
-        }
-        let data = try JSONEncoder().encode(tokens)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: accountPrefix + tokens.accountId
-        ]
-        let attributes: [String: Any] = [
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        ]
-        let status: OSStatus
-        if SecItemCopyMatching(query as CFDictionary, nil) == errSecSuccess {
-            status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        } else {
-            status = SecItemAdd(query.merging(attributes) { _, new in new } as CFDictionary, nil)
-        }
-        guard status == errSecSuccess else {
-            throw MeterError.message("Could not save credentials in Keychain (\(status)).")
-        }
-    }
+    static func load(accountId: String) -> AuthTokens? { repository.load(localAccountId: accountId) }
+    static func loadAll() -> [AuthTokens] { repository.loadAll() }
+    static func remove(accountId: String) throws { try repository.remove(localAccountId: accountId) }
+    static func clearAll() throws { try repository.clearAll() }
+}
 
-    static func load(accountId: String) -> AuthTokens? {
-        load(keychainAccount: accountPrefix + accountId)
-    }
+/// Tests inject a unique service. Production retains the existing service and
+/// accessibility, with a separate v3 account for each local identity.
+struct KeychainCredentialStorage: CredentialStorage {
+    let service: String
 
-    static func loadAll() -> [AuthTokens] {
-        migrateLegacyAccountIfNeeded()
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecReturnAttributes as String: true,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitAll
-        ]
+    func items() throws -> [String: Data] {
+        var query = baseQuery
+        query[kSecReturnAttributes as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitAll
         var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else { return [] }
-        let items = result as? [[String: Any]] ?? []
-        return items.compactMap { item in
-            guard
-                let key = item[kSecAttrAccount as String] as? String,
-                key.hasPrefix(accountPrefix),
-                let data = item[kSecValueData as String] as? Data,
-                let tokens = try? JSONDecoder().decode(AuthTokens.self, from: data),
-                tokens.isUsable
-            else { return nil }
-            return tokens
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound { return [:] }
+        try check(status, operation: "read")
+        var items: [String: Data] = [:]
+        for item in result as? [[String: Any]] ?? [] {
+            guard let key = item[kSecAttrAccount as String] as? String else { continue }
+            // macOS does not permit returning every password's data in one query.
+            // Enumerate attributes, then read only the specific credential item.
+            var dataQuery = baseQuery
+            dataQuery[kSecAttrAccount as String] = key
+            dataQuery[kSecReturnData as String] = true
+            dataQuery[kSecMatchLimit as String] = kSecMatchLimitOne
+            var value: CFTypeRef?
+            let dataStatus = SecItemCopyMatching(dataQuery as CFDictionary, &value)
+            if dataStatus == errSecItemNotFound { continue }
+            try check(dataStatus, operation: "read")
+            if let data = value as? Data { items[key] = data }
         }
-        .sorted { lhs, rhs in
-            let left = lhs.email.isEmpty ? lhs.accountId : lhs.email
-            let right = rhs.email.isEmpty ? rhs.accountId : rhs.email
-            return left.localizedCaseInsensitiveCompare(right) == .orderedAscending
-        }
+        return items
     }
 
-    static func remove(accountId: String) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: accountPrefix + accountId
-        ]
-        SecItemDelete(query as CFDictionary)
+    func write(_ data: Data, for key: String) throws {
+        var query = baseQuery
+        query[kSecAttrAccount as String] = key
+        var attributes: [String: Any] = [kSecValueData as String: data]
+        #if os(iOS)
+        attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        #endif
+        // The host tests use the macOS file Keychain, which has no iOS
+        // accessibility classes. iOS retains its existing device-only protection.
+        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            try check(SecItemAdd(query.merging(attributes) { _, new in new } as CFDictionary, nil), operation: "add")
+        } else { try check(status, operation: "update") }
     }
 
-    static func clearAll() {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service
-        ]
-        SecItemDelete(query as CFDictionary)
+    func remove(_ key: String) throws {
+        var query = baseQuery
+        query[kSecAttrAccount as String] = key
+        let status = SecItemDelete(query as CFDictionary)
+        if status != errSecItemNotFound { try check(status, operation: "delete") }
     }
 
-    private static func load(keychainAccount: String) -> AuthTokens? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: keychainAccount,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var result: CFTypeRef?
-        guard
-            SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-            let data = result as? Data,
-            let tokens = try? JSONDecoder().decode(AuthTokens.self, from: data),
-            tokens.isUsable
-        else { return nil }
-        return tokens
+    func removeAll() throws {
+        var query = baseQuery
+        query[kSecMatchLimit as String] = kSecMatchLimitAll
+        let status = SecItemDelete(query as CFDictionary)
+        if status != errSecItemNotFound { try check(status, operation: "delete") }
     }
 
-    private static func migrateLegacyAccountIfNeeded() {
-        guard let tokens = load(keychainAccount: legacyAccount), !tokens.accountId.isEmpty else { return }
-        try? save(tokens)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: legacyAccount
-        ]
-        SecItemDelete(query as CFDictionary)
+    private var baseQuery: [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service]
+    }
+
+    private func check(_ status: OSStatus, operation: String) throws {
+        guard status == errSecSuccess else { throw MeterError.message("Could not \(operation) credentials in Keychain (\(status)).") }
     }
 }

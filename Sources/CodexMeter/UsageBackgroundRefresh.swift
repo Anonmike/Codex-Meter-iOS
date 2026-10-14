@@ -52,9 +52,9 @@ enum UsageBackgroundRefresh {
             for token in tokens {
                 group.addTask {
                     do {
-                        let previous = await CodexAPI.shared.cachedUsage(accountId: token.accountId)
-                        let refreshed = try await CodexAPI.shared.refreshAll(accountId: token.accountId)
-                        let stateID = AccountSource.direct(accountId: token.accountId).stateID
+                        let previous = await CodexAPI.shared.cachedUsage(accountId: token.localAccountId)
+                        let refreshed = try await CodexAPI.shared.refreshAll(accountId: token.localAccountId)
+                        let stateID = AccountSource.direct(accountId: token.localAccountId).stateID
                         await ResetAlertScheduler.notifyIfUnexpectedReset(
                             accountID: stateID,
                             accountName: AccountNicknameStore.nickname(for: stateID) ?? token.email,
@@ -62,9 +62,9 @@ enum UsageBackgroundRefresh {
                             previous: previous,
                             current: refreshed.0
                         )
-                        return (token.accountId, true)
+                        return (token.localAccountId, true)
                     } catch {
-                        return (token.accountId, false)
+                        return (token.localAccountId, false)
                     }
                 }
             }
@@ -113,13 +113,13 @@ enum UsageBackgroundRefresh {
         }
 
         var widgetAccounts: [AccountUsageSnapshot] = []
-        for token in tokens {
-            let stateID = AccountSource.direct(accountId: token.accountId).stateID
-            let usage = await CodexAPI.shared.cachedUsage(accountId: token.accountId)
+        for token in KeychainTokenStore.loadAll() {
+            let stateID = AccountSource.direct(accountId: token.localAccountId).stateID
+            let usage = await CodexAPI.shared.cachedUsage(accountId: token.localAccountId)
             widgetAccounts.append(AccountUsageSnapshot(
                 id: stateID, email: token.email,
                 nickname: AccountNicknameStore.nickname(for: stateID), usage: usage,
-                isStale: usage != nil && !refreshedDirectAccounts.contains(token.accountId),
+                isStale: usage != nil && !refreshedDirectAccounts.contains(token.localAccountId),
                 lastSuccessfulAt: usage?.fetchedAt
             ))
         }

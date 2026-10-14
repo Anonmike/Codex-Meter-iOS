@@ -41,6 +41,7 @@ let package = Package(
             swiftSettings: [.unsafeFlags(["-disable-batch-mode"])],
             linkerSettings: liquidGlassSDKStamp
         ),
-        .testTarget(name: "CodexMeterTests", dependencies: ["CodexMeterCore"]),
+        .target(name: "TestSupport", dependencies: ["CodexMeterCore"], path: "Tests/Support"),
+        .testTarget(name: "CodexMeterTests", dependencies: ["CodexMeterCore", "TestSupport"]),
     ]
 )

@@ -3,6 +3,7 @@ import CodexMeterCore
 
 struct AccountMeterState: Identifiable, Equatable {
     let source: AccountSource
+    var sessionGeneration = UUID()
     var email: String
     var nickname: String?
     var proxyName: String?
@@ -59,6 +60,7 @@ final class MeterViewModel: ObservableObject {
     func setDemoMode(_ enabled: Bool) {
         guard enabled != isDemoMode else { return }
         oauth.cancel(notify: false)
+        isSigningIn = false
         UserDefaults.standard.set(enabled, forKey: UsageBackgroundRefresh.demoModeKey)
         isDemoMode = enabled
         accounts = enabled ? Self.demoAccounts() : Self.storedAccounts()
@@ -87,10 +89,12 @@ final class MeterViewModel: ObservableObject {
             self.isSigningIn = false
             switch result {
             case let .success(tokens):
-                let source = AccountSource.direct(accountId: tokens.accountId)
+                let source = AccountSource.direct(accountId: tokens.localAccountId)
                 if let index = self.accounts.firstIndex(where: { $0.source == source }) {
+                    self.accounts[index].sessionGeneration = UUID()
                     self.accounts[index].email = tokens.email
                     self.accounts[index].errorMessage = nil
+                    self.accounts[index].isRefreshing = false
                     self.toastMessage = "Account reconnected"
                 } else {
                     self.accounts.append(AccountMeterState(
@@ -166,7 +170,7 @@ final class MeterViewModel: ObservableObject {
         let ids = accounts.filter { !$0.isRefreshing }.map(\.id)
         guard !ids.isEmpty else { return }
         for id in ids { setRefreshing(true, stateID: id, clearError: !silently) }
-        let inputs = ids.compactMap { id in accounts.first(where: { $0.id == id }).map { RefreshInput(source: $0.source) } }
+        let inputs = ids.compactMap { id in accounts.first(where: { $0.id == id }).map { RefreshInput(source: $0.source, generation: $0.sessionGeneration) } }
         await withTaskGroup(of: AccountRefreshResult.self) { group in
             for input in inputs { group.addTask { await Self.refreshResult(input) } }
             for await result in group { apply(result) }
@@ -179,7 +183,7 @@ final class MeterViewModel: ObservableObject {
     func refresh(stateID: String, silently: Bool = false) async {
         if isDemoMode { await refresh(silently: silently); return }
         guard let index = accounts.firstIndex(where: { $0.id == stateID }), !accounts[index].isRefreshing else { return }
-        let input = RefreshInput(source: accounts[index].source)
+        let input = RefreshInput(source: accounts[index].source, generation: accounts[index].sessionGeneration)
         setRefreshing(true, stateID: stateID, clearError: !silently)
         apply(await Self.refreshResult(input))
         await finishRefreshCycle()
@@ -202,8 +206,8 @@ final class MeterViewModel: ObservableObject {
                 outcome = try await ProxyAPI.shared.consumeReset(profile, creditId: state.resetCredits?.preferredCredit?.id)
             }
             toastMessage = resetOutcomeMessage(outcome)
-            apply(await Self.refreshResult(RefreshInput(source: state.source)), detectUnexpectedReset: false)
-        } catch { apply(.failure(state.id, error.localizedDescription)) }
+            apply(await Self.refreshResult(RefreshInput(source: state.source, generation: state.sessionGeneration)), detectUnexpectedReset: false)
+        } catch { apply(.failure(state.id, state.sessionGeneration, error.localizedDescription)) }
         await finishRefreshCycle()
     }
 
@@ -211,11 +215,13 @@ final class MeterViewModel: ObservableObject {
         guard !isDemoMode else { return }
         guard let state = accounts.first(where: { $0.id == stateID }) else { return }
         oauth.cancel(notify: false)
+        isSigningIn = false
         switch state.source {
         case let .direct(accountId):
             let tokens = KeychainTokenStore.load(accountId: accountId)
-            KeychainTokenStore.remove(accountId: accountId)
-            Task { if let tokens { await AuthAPI.revoke(tokens) } }
+            do { try KeychainTokenStore.remove(accountId: accountId) }
+            catch { errorMessage = error.localizedDescription; return }
+            Task { if let tokens { await AuthAPI.shared.revoke(tokens) } }
         case let .proxy(profileId):
             try? ProxyProfileStore.remove(profileId)
             ProxyCredentialStore.remove(id: profileId)
@@ -234,7 +240,9 @@ final class MeterViewModel: ObservableObject {
         let tokens = KeychainTokenStore.loadAll()
         let states = accounts
         oauth.cancel(notify: false)
-        KeychainTokenStore.clearAll()
+        isSigningIn = false
+        do { try KeychainTokenStore.clearAll() }
+        catch { errorMessage = error.localizedDescription; return }
         ProxyCredentialStore.removeAll()
         ProxyProfileStore.removeAll()
         AccountNicknameStore.removeAll()
@@ -243,7 +251,7 @@ final class MeterViewModel: ObservableObject {
         Task {
             for state in states { await CodexAPI.shared.removeCache(accountId: cacheID(for: state.source)) }
             await finishRefreshCycle()
-            for token in tokens { await AuthAPI.revoke(token) }
+            for token in tokens { await AuthAPI.shared.revoke(token) }
         }
     }
 
@@ -278,7 +286,7 @@ final class MeterViewModel: ObservableObject {
             switch input.source {
             case let .direct(accountId):
                 let value = try await CodexAPI.shared.refreshAll(accountId: accountId)
-                return .success(input.source.stateID, value.0, value.1, nil, nil)
+                return .success(input.source.stateID, input.generation, value.0, value.1, nil, nil)
             case let .proxy(profileId):
                 guard var profile = ProxyProfileStore.loadAll().first(where: { $0.id == profileId }) else {
                     throw MeterError.message("The proxy configuration is missing.")
@@ -290,24 +298,28 @@ final class MeterViewModel: ObservableObject {
                 profile.lastSuccessfulRefresh = parsed.usage.fetchedAt
                 try ProxyProfileStore.upsert(profile)
                 await CodexAPI.shared.cacheSnapshots(usage: parsed.usage, credits: parsed.resetCredits, cacheId: input.source.stateID)
-                return .success(input.source.stateID, parsed.usage, parsed.resetCredits, parsed.email, profile.name)
+                return .success(input.source.stateID, input.generation, parsed.usage, parsed.resetCredits, parsed.email, profile.name)
             }
-        } catch { return .failure(input.source.stateID, error.localizedDescription) }
+        } catch { return .failure(input.source.stateID, input.generation, error.localizedDescription) }
     }
 
     private func loadCachedSnapshots() async {
-        for index in accounts.indices {
-            let cache = cacheID(for: accounts[index].source)
-            accounts[index].usage = await CodexAPI.shared.cachedUsage(accountId: cache)
-            accounts[index].resetCredits = await CodexAPI.shared.cachedCredits(accountId: cache)
+        for state in accounts {
+            let cache = cacheID(for: state.source)
+            let usage = await CodexAPI.shared.cachedUsage(accountId: cache)
+            let credits = await CodexAPI.shared.cachedCredits(accountId: cache)
+            guard let index = accounts.firstIndex(where: { $0.id == state.id }) else { continue }
+            accounts[index].usage = usage
+            accounts[index].resetCredits = credits
         }
         await publishWidgetSnapshots()
     }
 
     private func apply(_ result: AccountRefreshResult, detectUnexpectedReset: Bool = true) {
         switch result {
-        case let .success(id, usage, credits, email, proxyName):
-            guard let index = accounts.firstIndex(where: { $0.id == id }) else { return }
+        case let .success(id, generation, usage, credits, email, proxyName):
+            guard let index = accounts.firstIndex(where: { $0.id == id }),
+                  accounts[index].sessionGeneration == generation else { return }
             let previousUsage = accounts[index].usage
             let accountName = accounts[index].displayName
             let accountCount = accounts.count
@@ -327,8 +339,9 @@ final class MeterViewModel: ObservableObject {
                     )
                 }
             }
-        case let .failure(id, message):
-            guard let index = accounts.firstIndex(where: { $0.id == id }) else { return }
+        case let .failure(id, generation, message):
+            guard let index = accounts.firstIndex(where: { $0.id == id }),
+                  accounts[index].sessionGeneration == generation else { return }
             accounts[index].isRefreshing = false
             accounts[index].errorMessage = message
             if case .proxy = accounts[index].source {
@@ -383,7 +396,7 @@ final class MeterViewModel: ObservableObject {
 
     private static func storedAccounts() -> [AccountMeterState] {
         let direct = KeychainTokenStore.loadAll().map {
-            let source = AccountSource.direct(accountId: $0.accountId)
+            let source = AccountSource.direct(accountId: $0.localAccountId)
             return AccountMeterState(
                 source: source, email: $0.email,
                 nickname: AccountNicknameStore.nickname(for: source.stateID), proxyName: nil
@@ -432,11 +445,11 @@ final class MeterViewModel: ObservableObject {
     }
 }
 
-private struct RefreshInput: Sendable { let source: AccountSource }
+private struct RefreshInput: Sendable { let source: AccountSource; let generation: UUID }
 
 private enum AccountRefreshResult: Sendable {
-    case success(String, UsageSnapshot, ResetCreditsSnapshot?, String?, String?)
-    case failure(String, String)
+    case success(String, UUID, UsageSnapshot, ResetCreditsSnapshot?, String?, String?)
+    case failure(String, UUID, String)
 }
 
 private func cacheID(for source: AccountSource) -> String {

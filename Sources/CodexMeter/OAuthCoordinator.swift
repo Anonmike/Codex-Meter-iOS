@@ -19,6 +19,8 @@ final class OAuthCoordinator: NSObject, ASWebAuthenticationPresentationContextPr
     private var completion: ((Result<AuthTokens, Error>) -> Void)?
     private var verifier = ""
     private var expectedState = ""
+    private var expectedNonce = ""
+    private var attemptID = UUID()
     private var redirectURI = ""
     private var portIndex = 0
     private let networkQueue = DispatchQueue(label: "codex-meter.oauth-callback")
@@ -28,6 +30,7 @@ final class OAuthCoordinator: NSObject, ASWebAuthenticationPresentationContextPr
         self.completion = completion
         verifier = Self.randomURLSafe(byteCount: 32)
         expectedState = Self.randomURLSafe(byteCount: 24)
+        expectedNonce = Self.randomURLSafe(byteCount: 24)
         portIndex = 0
         switch method {
         case .browser:
@@ -40,6 +43,7 @@ final class OAuthCoordinator: NSObject, ASWebAuthenticationPresentationContextPr
     }
 
     func cancel(notify: Bool = true) {
+        attemptID = UUID()
         let pendingCompletion = completion
         completion = nil
         deviceTask?.cancel()
@@ -54,6 +58,7 @@ final class OAuthCoordinator: NSObject, ASWebAuthenticationPresentationContextPr
     }
 
     private func startDeviceCodeFlow() async {
+        let attempt = attemptID
         do {
             let authorization = try await DeviceCodeAuth.requestAuthorization()
             try Task.checkCancellation()
@@ -66,17 +71,20 @@ final class OAuthCoordinator: NSObject, ASWebAuthenticationPresentationContextPr
 
             let response = try await DeviceCodeAuth.pollForAuthorization(authorization)
             try Task.checkCancellation()
-            let tokens = try await AuthAPI.exchange(
+            let tokens = try await AuthAPI.shared.exchange(
                 code: response.authorizationCode,
                 redirectURI: "https://auth.openai.com/deviceauth/callback",
                 verifier: response.codeVerifier
             )
-            try KeychainTokenStore.save(tokens)
-            finish(.success(tokens))
+            let matches = await AuthAPI.shared.matchingLegacyAccounts(for: tokens, existing: KeychainTokenStore.loadAll())
+            try Task.checkCancellation()
+            guard attempt == attemptID, completion != nil else { return }
+            let connected = try KeychainTokenStore.repository.connect(tokens, matchingLegacy: matches)
+            finish(.success(connected))
         } catch is CancellationError {
             return
         } catch {
-            guard completion != nil else { return }
+            guard attempt == attemptID, completion != nil else { return }
             finish(.failure(error))
         }
     }
@@ -135,6 +143,7 @@ final class OAuthCoordinator: NSObject, ASWebAuthenticationPresentationContextPr
             URLQueryItem(name: "id_token_add_organizations", value: "true"),
             URLQueryItem(name: "codex_cli_simplified_flow", value: "true"),
             URLQueryItem(name: "state", value: expectedState),
+            URLQueryItem(name: "nonce", value: expectedNonce),
             URLQueryItem(name: "originator", value: CodexConstants.originator)
         ]
         guard let url = components.url else {
@@ -179,6 +188,10 @@ final class OAuthCoordinator: NSObject, ASWebAuthenticationPresentationContextPr
     }
 
     private func handleCallback(target: String, connection: NWConnection) {
+        guard completion != nil else {
+            Self.respond(connection, status: 400, message: "This sign-in is no longer active.", success: false)
+            return
+        }
         guard let components = URLComponents(string: "http://localhost\(target)"), components.path == "/auth/callback" else {
             Self.respond(connection, status: 404, message: "Not found.", success: false)
             return
@@ -201,20 +214,29 @@ final class OAuthCoordinator: NSObject, ASWebAuthenticationPresentationContextPr
         }
         let redirect = redirectURI
         let verifier = verifier
+        let nonce = expectedNonce
+        let attempt = attemptID
         Task {
             do {
-                let tokens = try await AuthAPI.exchange(code: code, redirectURI: redirect, verifier: verifier)
-                try KeychainTokenStore.save(tokens)
+                let tokens = try await AuthAPI.shared.exchange(code: code, redirectURI: redirect, verifier: verifier, nonce: nonce)
+                let matches = await AuthAPI.shared.matchingLegacyAccounts(for: tokens, existing: KeychainTokenStore.loadAll())
+                guard attempt == attemptID, completion != nil else {
+                    Self.respond(connection, status: 400, message: "This sign-in is no longer active.", success: false)
+                    return
+                }
+                let connected = try KeychainTokenStore.repository.connect(tokens, matchingLegacy: matches)
                 Self.respond(connection, status: 200, message: "Your ChatGPT account is connected. You can close this page and return to Codex Meter.", success: true)
-                await MainActor.run { self.finish(.success(tokens)) }
+                self.finish(.success(connected))
             } catch {
                 Self.respond(connection, status: 500, message: error.localizedDescription, success: false)
-                await MainActor.run { self.finish(.failure(error)) }
+                guard attempt == attemptID, completion != nil else { return }
+                self.finish(.failure(error))
             }
         }
     }
 
     private func finish(_ result: Result<AuthTokens, Error>) {
+        attemptID = UUID()
         let pendingCompletion = completion
         completion = nil
         deviceTask?.cancel()
